@@ -1,97 +1,265 @@
 import sys
+
 from PyQt6.QtWidgets import (
+
     QApplication,
+
     QMainWindow,
+
     QPushButton,
+
     QVBoxLayout,
+
     QWidget,
+
+    QLabel,
+
 )
 
-# Import các trang con
-from detect import DetectDialog
-from redlight import RedLightDialog
-from speed import SpeedDialog
-from helmet import HelmetDialog
-from report import ReportDialog
+from PyQt6.QtGui import QFont
+
+from PyQt6.QtCore import Qt
+
+
+
+# ======================
+
+# Import các module con
+
+# ======================
+
+from detect import DetectDialog         # Nhận diện phương tiện
+
+from redlight import RedLightDialog     # Nhận diện đèn báo + vượt đèn đỏ
+
+from license_plate import PlateDialog   # Nhận diện biển số xe (bạn đặt tên file là license_plate.py)
+
+from report import ReportDialog         # Báo cáo & lưu trữ kết quả
+from redlight_violation import RedLight_violationDialog #  vượt đèn đỏ
+
+
 
 
 class MainWindow(QMainWindow):
+
     def __init__(self):
+
         super().__init__()
 
+
+
+        # ======================
+
         # Cấu hình cửa sổ chính
-        self.setWindowTitle("🚦 Hệ thống nhận diện vi phạm giao thông")
-        self.setFixedSize(600, 400)
+
+        # ======================
+
+        self.setWindowTitle("🚦 HỆ THỐNG NHẬN DIỆN VI PHẠM GIAO THÔNG")
+
+        self.setFixedSize(700, 480)
+
+        self.setStyleSheet("QMainWindow { background-color: #f2f6fa; }")
+
+
+
+        # ======================
 
         # Layout chính
-        layout = QVBoxLayout()
 
-        # Các nút chức năng
-        self.btn_detect = self.create_button("🚗 Nhận diện phương tiện", self.open_detect)
-        self.btn_redlight = self.create_button("🚦 Vượt đèn đỏ", self.open_redlight)
-        self.btn_speed = self.create_button("💨 Tốc độ", self.open_speed)
-        self.btn_helmet = self.create_button("🪖 Không đội mũ bảo hiểm", self.open_helmet)
-        self.btn_report = self.create_button("📊 Báo cáo", self.open_report)
+        # ======================
 
-        # Thêm nút vào layout
-        layout.addWidget(self.btn_detect)
-        layout.addWidget(self.btn_redlight)
-        layout.addWidget(self.btn_speed)
-        layout.addWidget(self.btn_helmet)
-        layout.addWidget(self.btn_report)
+        main_layout = QVBoxLayout()
 
-        # Container chính
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+
+
+        # Tiêu đề
+
+        title = QLabel("HỆ THỐNG NHẬN DIỆN VI PHẠM GIAO THÔNG")
+
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+
+        main_layout.addWidget(title)
+
+        main_layout.addSpacing(25)
+
+
+
+        # ======================
+
+        # Tạo các nút chức năng
+
+        # ======================
+
+        buttons = [
+
+            ("🚗 Nhận diện phương tiện", self.open_detect),
+
+            ("🚦 Nhận diện đèn báo giao thông", self.open_redlight),
+
+            ("🔢 Nhận diện biển số xe", self.open_plate),
+
+            ("❌ Phát hiện vượt đèn đỏ", self.open_redlight_violation),
+
+            ("📊 Lưu trữ & Báo cáo kết quả", self.open_report),
+
+        ]
+
+
+
+        for text, func in buttons:
+
+            btn = self.create_button(text, func)
+
+            main_layout.addWidget(btn)
+
+
+
+        # ======================
+
+        # Thiết lập container
+
+        # ======================
+
         container = QWidget()
-        container.setLayout(layout)
+
+        container.setLayout(main_layout)
+
         self.setCentralWidget(container)
 
-        # Thêm CSS
+
+
+        # ======================
+
+        # CSS cho nút bấm
+
+        # ======================
+
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f4f6f9;
-            }
+
             QPushButton {
-                background-color: #2e86de;
+
+                background-color: #0078D7;
+
                 color: white;
+
                 font-size: 16px;
+
                 font-weight: bold;
+
                 padding: 12px;
-                border-radius: 12px;
-                margin: 8px;
+
+                border-radius: 10px;
+
+                margin: 8px 60px;
+
             }
+
             QPushButton:hover {
-                background-color: #1e5fab;
+
+                background-color: #005fa3;
+
             }
+
             QPushButton:pressed {
-                background-color: #163d73;
+
+                background-color: #003f73;
+
             }
+
         """)
 
+
+
+    # ======================
+
+    # Hàm tạo nút bấm
+
+    # ======================
+
     def create_button(self, text, slot):
-        """Hàm tạo QPushButton kèm sự kiện."""
+
         btn = QPushButton(text)
+
         btn.clicked.connect(slot)
+
         return btn
 
-    # ================== Các hàm mở dialog ==================
+
+
+    # ======================
+
+    # Các hàm mở dialogq
+
+    # ======================
+
     def open_detect(self):
-        DetectDialog().exec()
+
+        """Mở chức năng nhận diện phương tiện."""
+
+        dialog = DetectDialog()
+
+        dialog.exec()
+
+
 
     def open_redlight(self):
-        RedLightDialog().exec()
 
-    def open_speed(self):
-        SpeedDialog().exec()
+        """Mở chức năng nhận diện đèn báo giao thông."""
 
-    def open_helmet(self):
-        HelmetDialog().exec()
+        dialog = RedLightDialog()
+
+        dialog.exec()
+
+
+
+    def open_plate(self):
+
+        """Mở chức năng nhận diện biển số xe."""
+
+        dialog = PlateDialog()
+
+        dialog.exec()
+
+
+
+    def open_redlight_violation(self):
+
+        """Mở chức năng phát hiện vi phạm giao thông."""
+
+        dialog = RedLight_violationDialog()  # Có thể dùng cùng dialog với redlight hoặc tách riêng file redlight_violation.py
+
+        dialog.exec()
+
+
 
     def open_report(self):
-        ReportDialog().exec()
 
+        """Mở chức năng lưu trữ & báo cáo kết quả."""
+
+        dialog = ReportDialog()
+
+        dialog.exec()
+
+
+
+
+
+# ======================
+
+# Chạy chương trình
+
+# ======================
 
 if __name__ == "__main__":
+
     app = QApplication(sys.argv)
+
     window = MainWindow()
+
     window.show()
+
     sys.exit(app.exec())
