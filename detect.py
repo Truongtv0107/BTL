@@ -1,84 +1,113 @@
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QFileDialog, QLabel
-from ultralytics import YOLO
 import cv2
-import tkinter as tk
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QLabel, QPushButton, QFileDialog, QMessageBox
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QImage, QPixmap
+from ultralytics import YOLO
 
 
-class DetectDialog(QDialog):
-    def __init__(self):
+# =============================
+# Luồng xử lý video song song
+# =============================
+class VideoThread(QThread):
+    change_pixmap_signal = pyqtSignal(QImage)
+
+    def __init__(self, source):
         super().__init__()
-        self.setWindowTitle("🚗 Nhận diện phương tiện")
-        self.setFixedSize(400, 300)
+        self.source = source
+        self.running = True
+        self.model = YOLO("yolov8n.pt")  # Model nhẹ, nhận diện COCO (xe, người, ô tô...)
 
-        # Layout
-        layout = QVBoxLayout()
-        self.label = QLabel("Chọn nguồn để bắt đầu nhận diện")
-        self.btn_camera = QPushButton("📷 Mở camera")
-        self.btn_file = QPushButton("📁 Mở video từ file")
-
-        layout.addWidget(self.label)
-        layout.addWidget(self.btn_camera)
-        layout.addWidget(self.btn_file)
-        self.setLayout(layout)
-
-        # Nạp mô hình YOLOv8
-        self.model = YOLO("yolov8n.pt")
-
-        # Gắn sự kiện nút
-        self.btn_camera.clicked.connect(self.detect_camera)
-        self.btn_file.clicked.connect(self.detect_file)
-
-    def detect_camera(self):
-        self.run_detect(0)  # 0 = webcam mặc định
-
-    def detect_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Chọn video",
-            "",
-            "Video Files (*.mp4 *.avi *.mov)"
-        )
-        if path:
-            self.run_detect(path)
-
-    def run_detect(self, source):
-        cap = cv2.VideoCapture(source)
-        if not cap.isOpened():
-            self.label.setText("❌ Không thể mở nguồn video")
-            return
-
-        # Tên cửa sổ
-        win_name = "Nhận diện phương tiện"
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win_name, 800, 800)
-        cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-
-        # Lấy độ phân giải màn hình để canh giữa
-        root = tk.Tk()
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        root.destroy()
-
-        # Tính tọa độ để đặt chính giữa
-        x = (screen_w - 800) // 2
-        y = (screen_h - 800) // 2
-        cv2.moveWindow(win_name, x, y)
-
-        while True:
+    def run(self):
+        cap = cv2.VideoCapture(self.source)
+        while self.running and cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Nhận diện bằng YOLO
+            # Nhận diện đối tượng
             results = self.model(frame)
-            annotated_frame = results[0].plot()
+            annotated = results[0].plot()
 
-            # Resize frame để vừa cửa sổ 800x800
-            annotated_frame = cv2.resize(annotated_frame, (800, 800))
-
-            cv2.imshow(win_name, annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            # Chuyển khung hình sang định dạng PyQt hiển thị
+            rgb_image = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            scaled = qt_image.scaled(640, 360, Qt.AspectRatioMode.KeepAspectRatio)
+            self.change_pixmap_signal.emit(scaled)
 
         cap.release()
-        cv2.destroyAllWindows()
+
+    def stop(self):
+        self.running = False
+        self.quit()
+        self.wait()
+
+
+# =============================
+# Giao diện nhận diện phương tiện
+# =============================
+class DetectDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🚗 Nhận diện phương tiện")
+        self.setFixedSize(700, 500)
+
+        self.layout = QVBoxLayout()
+        self.layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("🚗 NHẬN DIỆN PHƯƠNG TIỆN TRÊN VIDEO")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.video_label = QLabel("Chưa có video hiển thị")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet("background-color: #000; color: white;")
+        self.video_label.setFixedSize(640, 360)
+
+        self.btn_open = QPushButton("📂 Chọn video để phân tích")
+        self.btn_open.clicked.connect(self.open_video)
+
+        self.btn_stop = QPushButton("⏹ Dừng lại")
+        self.btn_stop.clicked.connect(self.stop_video)
+        self.btn_stop.setEnabled(False)
+
+        self.layout.addWidget(title)
+        self.layout.addSpacing(20)
+        self.layout.addWidget(self.video_label)
+        self.layout.addSpacing(10)
+        self.layout.addWidget(self.btn_open)
+        self.layout.addWidget(self.btn_stop)
+        self.setLayout(self.layout)
+
+        self.thread = None
+
+    def open_video(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Chọn video", "", "Video Files (*.mp4 *.avi)")
+        if file_path:
+            self.btn_open.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            QMessageBox.information(self, "Đang xử lý", f"Phân tích video:\n{file_path}")
+
+            self.thread = VideoThread(file_path)
+            self.thread.change_pixmap_signal.connect(self.update_image)
+            self.thread.start()
+
+    def update_image(self, qt_image):
+        """Hiển thị khung hình lên QLabel"""
+        self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+
+    def stop_video(self):
+        if self.thread:
+            self.thread.stop()
+            self.btn_open.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            QMessageBox.information(self, "Tạm dừng", "Đã dừng phát video.")
+
+    def closeEvent(self, event):
+        """Dừng luồng khi đóng cửa sổ"""
+        if self.thread:
+            self.thread.stop()
+        event.accept()
