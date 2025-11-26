@@ -2,21 +2,21 @@ import sys
 import os
 import cv2
 import csv
-import time
 import datetime
-import numpy as np
 import tkinter as tk
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QPushButton, QLabel, QFileDialog, QApplication, QMessageBox
+    QDialog, QVBoxLayout, QPushButton, QLabel,
+    QFileDialog, QApplication
 )
 from ultralytics import YOLO
-
-# ---------- Cấu hình chung ----------
+#by Truong Viet Tran , do not reup ,sdt:0877973723
+# ================== CẤU HÌNH CHUNG ==================
 TARGET_W, TARGET_H = 1280, 720
 
-ROI_LIGHT_LEFT = (21 - 15, 108 - 35, 21 + 15, 108 + 35)   # (x1,y1,x2,y2)
-ROI_LIGHT_RIGHT = (1242, 34, 1272, 104)                  # (x1,y1,x2,y2)
+# ROI đèn giao thông (x1, y1, x2, y2)
+ROI_LIGHT_LEFT = (21 - 15, 108 - 15, 21 + 15, 150 + 35)
+ROI_LIGHT_RIGHT = (1242, 30, 1272, 125)
 
 LINE_THICKNESS = 12
 
@@ -27,11 +27,16 @@ STOP_LINE_X3 = 1086
 STOP_LINE_Y_HEIGHT = 400  # y (pixel) của vạch dừng
 LINE_Y = STOP_LINE_Y_HEIGHT
 
+# Vạch chéo / phụ
 LINE3_X1, LINE3_Y1 = 73, 401
 LINE3_X2, LINE3_Y2 = 352, 83
 
-LINE_S4_X1, LINE_S4_Y1 = 1123, 370
-LINE_S4_X2, LINE_S4_Y2 = 1005, 81
+LINE_S4_X1, LINE_S4_Y1 = 1100,390
+LINE_S4_X2, LINE_S4_Y2 = 950,85
+
+# Vạch S5 ngang
+LINE_S5_X1, LINE_S5_Y = 215, 235
+LINE_S5_X2 = 1025
 
 # Bản đồ màu (BGR)
 COLOR_MAP = {
@@ -41,66 +46,200 @@ COLOR_MAP = {
     "UNKNOWN": (255, 255, 255)
 }
 
-VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO indices, tuỳ model)
+# Lớp xe trong COCO
+VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
 # Thư mục lưu vi phạm + báo cáo
 VIOLATION_DIR = "violations"
-REPORT_CSV = os.path.join(VIOLATION_DIR, "report.csv")
+REPORT_CSV = os.path.join(VIOLATION_DIR, "report.csv")   # chi tiết bbox, ảnh, đèn
+STATUS_CSV = os.path.join(VIOLATION_DIR, "status.csv")   # bảng: track_id, ngày, loại, tình trạng
 
+
+# ================== HÀM TIỆN ÍCH ==================
 def ensure_violation_dir():
+    """Tạo thư mục và 2 file CSV (report, status) nếu chưa có."""
     os.makedirs(VIOLATION_DIR, exist_ok=True)
-    # nếu chưa có file csv, tạo và viết header
+
+    # report.csv – chi tiết vi phạm (id riêng cho mỗi lần lưu)
     if not os.path.exists(REPORT_CSV):
         with open(REPORT_CSV, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "id", "timestamp", "image_path",
                 "x1", "y1", "x2", "y2", "cx", "bottom_y",
-                "lane", "light_right", "light_left"
+                "lane", "light_right", "light_left", "track_id"
             ])
 
+    # status.csv – bảng tóm tắt xử lý (dùng track_id làm khóa)
+    if not os.path.exists(STATUS_CSV):
+        with open(STATUS_CSV, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "track_id", "ngay_vi_pham", "loai_vi_pham", "tinh_trang"
+            ])
+
+
 def get_screen_size():
+    """Lấy kích thước màn hình (dùng Tkinter)."""
     root = tk.Tk()
     root.withdraw()
     return root.winfo_screenwidth(), root.winfo_screenheight()
 
+
 def clamp_roi(x1, y1, x2, y2, w, h):
+    """Giới hạn ROI trong khung hình."""
     x1c = max(0, min(w - 1, int(round(x1))))
     y1c = max(0, min(h - 1, int(round(y1))))
-    x2c = max(0, min(w, int(round(x2))))
-    y2c = max(0, min(h, int(round(y2))))
+    x2c = max(0, min(w,      int(round(x2))))
+    y2c = max(0, min(h,      int(round(y2))))
     if x2c <= x1c or y2c <= y1c:
         return None
     return x1c, y1c, x2c, y2c
 
-def bgr_mean_to_hsv_color(roi_bgr):
-    if roi_bgr is None or roi_bgr.size == 0:
-        return None
-    roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = roi_hsv[..., 0].mean(), roi_hsv[..., 1].mean(), roi_hsv[..., 2].mean()
-    return h, s, v
 
-def decide_light_from_hsv(h, s, v, is_right=False):
-    if h is None:
+def detect_light_color(roi_bgr):
+    """
+    Nhận diện màu đèn từ ROI bằng HSV.
+    Đếm số pixel RED / YELLOW / GREEN và chọn nhiều nhất nếu vượt ngưỡng.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
         return "UNKNOWN"
-    if v < 50 or s < 50:
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    sat_mask = s > 80
+    val_mask = v > 80
+    sv_mask = cv2.bitwise_and(sat_mask.astype('uint8'), val_mask.astype('uint8'))
+
+    # RED
+    red_mask1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+    red_mask2 = cv2.inRange(hsv, (160, 80, 80), (180, 255, 255))
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+    # YELLOW
+    yellow_mask = cv2.inRange(hsv, (15, 80, 80), (35, 255, 255))
+
+    # GREEN
+    green_mask = cv2.inRange(hsv, (40, 80, 80), (85, 255, 255))
+
+    # Áp mask S,V
+    red_mask = cv2.bitwise_and(red_mask, red_mask, mask=sv_mask)
+    yellow_mask = cv2.bitwise_and(yellow_mask, yellow_mask, mask=sv_mask)
+    green_mask = cv2.bitwise_and(green_mask, green_mask, mask=sv_mask)
+
+    red_count = int(cv2.countNonZero(red_mask))
+    yellow_count = int(cv2.countNonZero(yellow_mask))
+    green_count = int(cv2.countNonZero(green_mask))
+
+    total_pixels = roi_bgr.shape[0] * roi_bgr.shape[1]
+    if total_pixels == 0:
         return "UNKNOWN"
-    if (h < 10 or h > 165) and v > 80:
+
+    min_ratio = 0.01
+    max_count = max(red_count, yellow_count, green_count)
+    if max_count < total_pixels * min_ratio:
+        return "UNKNOWN"
+
+    if max_count == red_count:
         return "RED"
-    if 20 <= h <= 40 and v > 90 and s > 80:
+    elif max_count == yellow_count:
         return "YELLOW"
-    if 35 <= h <= 90 and v > 80 and s > 80:
+    elif max_count == green_count:
         return "GREEN"
-    if is_right:
-        if 35 <= h <= 90 and v > 80 and s > 70:
-            return "GREEN"
-        return "RED"
     return "UNKNOWN"
 
+
+def detect_left_light(roi_bgr):
+    """
+    Đèn bên trái CHỈ có 2 trạng thái: RED hoặc GREEN.
+    Nếu không rõ (YELLOW/UNKNOWN) -> ép về RED (an toàn).
+    """
+    base = detect_light_color(roi_bgr)
+    if base == "GREEN":
+        return "GREEN"
+    return "RED"
+
+
+# ================== SIMPLE TRACKER ==================
+class SimpleTracker:
+    """
+    Tracker đơn giản theo dõi xe bằng tâm (cx, bottom_y).
+    Gán ID cho mỗi xe mới, ghép detection mới với object cũ bằng khoảng cách tâm.
+    """
+    def __init__(self, dist_thresh=80, max_lost=10):
+        self.next_id = 1
+        self.objects = {}  # id -> {'cx','bottom_y','bbox','lost'}
+        self.dist_thresh = dist_thresh
+        self.max_lost = max_lost
+
+    def update(self, detections):
+        """
+        detections: list[{'cx', 'bottom_y', 'bbox'}]
+        return: list[{'id', 'cx', 'bottom_y', 'bbox'}]
+        """
+        results = []
+
+        for obj in self.objects.values():
+            obj["updated"] = False
+
+        for det in detections:
+            cx = det["cx"]
+            by = det["bottom_y"]
+
+            best_id = None
+            best_dist = None
+
+            for obj_id, obj in self.objects.items():
+                dx = cx - obj["cx"]
+                dy = by - obj["bottom_y"]
+                dist = (dx ** 2 + dy ** 2) ** 0.5
+                if dist <= self.dist_thresh and (best_dist is None or dist < best_dist):
+                    best_dist = dist
+                    best_id = obj_id
+
+            if best_id is not None:
+                obj = self.objects[best_id]
+                obj["cx"] = cx
+                obj["bottom_y"] = by
+                obj["bbox"] = det["bbox"]
+                obj["lost"] = 0
+                obj["updated"] = True
+
+                det_with_id = det.copy()
+                det_with_id["id"] = best_id
+                results.append(det_with_id)
+            else:
+                new_id = self.next_id
+                self.next_id += 1
+                self.objects[new_id] = {
+                    "cx": cx,
+                    "bottom_y": by,
+                    "bbox": det["bbox"],
+                    "lost": 0,
+                    "updated": True,
+                }
+                det_with_id = det.copy()
+                det_with_id["id"] = new_id
+                results.append(det_with_id)
+
+        to_delete = []
+        for obj_id, obj in self.objects.items():
+            if not obj.get("updated", False):
+                obj["lost"] += 1
+                if obj["lost"] > self.max_lost:
+                    to_delete.append(obj_id)
+
+        for obj_id in to_delete:
+            del self.objects[obj_id]
+
+        return results
+
+
+# ================== WORKER YOLO ==================
 class DetectWorker(QThread):
     status_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
-    # optional: can emit new violation info for GUI
     new_violation_signal = pyqtSignal(dict)
 
     def __init__(self, source=0, model_path="yolov8m.pt"):
@@ -109,17 +248,33 @@ class DetectWorker(QThread):
         self.model_path = model_path
         self._running = False
         self.model = None
-        self.violation_counter = 0  # để đặt id file
+
+        # id riêng cho mỗi lần lưu vào report.csv
+        self.violation_counter = 0
 
         ensure_violation_dir()
-        # khởi tạo counter từ CSV hiện tại (nếu có) để tránh trùng id
+        self._init_violation_counter_from_csv()
+
+        # Tracker & danh sách track_id đã vi phạm
+        self.tracker = SimpleTracker(dist_thresh=80, max_lost=10)
+        self.violated_track_ids = set()
+
+        # 🔥 ĐỌC TOÀN BỘ track_id ĐÃ CÓ TRONG status.csv, LOẠI TRÙNG THEO LỊCH SỬ
+        self._load_violated_track_ids_from_csv()
+
+        # Lưu các vi phạm gần đây (khử trùng theo không gian + thời gian)
+        # mỗi phần tử: {"track_id", "cx", "bottom_y", "bbox", "time"}
+        self.recent_violations = []
+
+    # ---------- Khởi tạo id ban đầu ----------
+    def _init_violation_counter_from_csv(self):
+        """Lấy id cuối cùng trong report.csv để tiếp tục đếm, tránh trùng id."""
         try:
             if os.path.exists(REPORT_CSV):
                 with open(REPORT_CSV, newline='', encoding='utf-8') as f:
                     reader = csv.reader(f)
                     rows = list(reader)
                     if len(rows) > 1:
-                        # last id
                         last = rows[-1][0]
                         try:
                             self.violation_counter = int(last)
@@ -128,53 +283,162 @@ class DetectWorker(QThread):
         except Exception:
             self.violation_counter = 0
 
+    def _load_violated_track_ids_from_csv(self):
+        """
+        Đọc status.csv và lấy toàn bộ track_id đã vi phạm trước đây.
+        Dùng để loại toàn bộ track_id đã được lưu, tránh lưu trùng khi chạy lại chương trình.
+        """
+        try:
+            if os.path.exists(STATUS_CSV):
+                with open(STATUS_CSV, newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    # Bỏ header
+                    next(reader, None)
+                    for row in reader:
+                        if not row:
+                            continue
+                        try:
+                            tid = int(row[0])
+                            self.violated_track_ids.add(tid)
+                        except Exception:
+                            continue
+        except Exception as e:
+            # Không dừng chương trình, chỉ báo lỗi
+            self.status_signal.emit(f"Lỗi đọc status.csv: {e}")
+
     def stop(self):
         self._running = False
 
-    def save_violation(self, crop_img, bbox, cx, bottom_y, lane, light_right, light_left):
+    # ---------- Khử trùng vi phạm ----------
+    def _cleanup_recent_violations(self, max_age_sec=5.0):
+        """Xóa các entry vi phạm quá cũ (mặc định > 5 giây)."""
+        now = datetime.datetime.now()
+        self.recent_violations = [
+            v for v in self.recent_violations
+            if (now - v["time"]).total_seconds() < max_age_sec
+        ]
+
+    @staticmethod
+    def _bbox_iou(b1, b2):
+        """Tính IoU giữa 2 bbox (x1,y1,x2,y2)."""
+        x1 = max(b1[0], b2[0])
+        y1 = max(b1[1], b2[1])
+        x2 = min(b1[2], b2[2])
+        y2 = min(b1[3], b2[3])
+
+        inter_w = max(0, x2 - x1)
+        inter_h = max(0, y2 - y1)
+        inter = inter_w * inter_h
+        if inter == 0:
+            return 0.0
+
+        area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+        area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+        union = max(1e-6, area1 + area2 - inter)
+        return inter / union
+
+    def _recently_captured(self, cx, bottom_y, bbox,
+                           pos_threshold=80, iou_threshold=0.3):
         """
-        Lưu ảnh crop và ghi vào report CSV.
-        crop_img: numpy array (BGR)
-        bbox: (x1,y1,x2,y2)
-        lane: str/int
+        Kiểm tra xem vi phạm này có trùng với 1 vi phạm đã lưu gần đây không.
+        - Gần về tâm (cx, bottom_y)
+        - IoU bbox đủ lớn
         """
+        for v in self.recent_violations:
+            if abs(cx - v["cx"]) < pos_threshold and abs(bottom_y - v["bottom_y"]) < pos_threshold:
+                iou = self._bbox_iou(bbox, v["bbox"])
+                if iou > iou_threshold:
+                    return True
+        return False
+
+    def _add_recent_violation(self, track_id, cx, bottom_y, bbox):
+        self.recent_violations.append({
+            "track_id": track_id,
+            "cx": cx,
+            "bottom_y": bottom_y,
+            "bbox": bbox,
+            "time": datetime.datetime.now(),
+        })
+
+    # ---------- Lưu vi phạm ----------
+    def save_violation(self, crop_img, bbox, cx, bottom_y,
+                       lane, light_right, light_left, track_id):
+        """
+        Lưu ảnh crop + ghi vào report.csv và status.csv.
+        - report.csv dùng id (violation_counter) để phân biệt từng lần lưu
+        - status.csv dùng track_id để thể hiện ID của tracking
+        """
+        # Nếu track_id đã có trong self.violated_track_ids thì không lưu nữa (phòng hờ)
+        if track_id in self.violated_track_ids:
+            return
+
         self.violation_counter += 1
         vid = self.violation_counter
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"violation_{timestamp}_{vid}.jpg"
+        now = datetime.datetime.now()
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        filename = f"violation_{timestamp_str}_{vid}.jpg"
         path = os.path.join(VIOLATION_DIR, filename)
-        # bảo đảm crop không rỗng
+
+        # Lưu ảnh
         try:
             if crop_img is None or crop_img.size == 0:
-                # fallback: không lưu ảnh, nhưng vẫn ghi report với empty path
                 img_path = ""
             else:
-                # nén và lưu
                 cv2.imwrite(path, crop_img)
                 img_path = path
         except Exception:
             img_path = ""
-        # ghi CSV
+
+        # Ghi chi tiết vào REPORT_CSV (kèm track_id)
         try:
             with open(REPORT_CSV, mode="a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([vid, datetime.datetime.now().isoformat(), img_path,
-                                 bbox[0], bbox[1], bbox[2], bbox[3], cx, bottom_y,
-                                 lane, light_right, light_left])
+                writer.writerow([
+                    vid,
+                    now.isoformat(),
+                    img_path,
+                    bbox[0], bbox[1], bbox[2], bbox[3],
+                    cx, bottom_y,
+                    lane, light_right, light_left,
+                    track_id
+                ])
         except Exception as e:
-            # nếu có lỗi ghi file, phát tín hiệu trạng thái
             self.status_signal.emit(f"Lỗi ghi báo cáo: {e}")
 
-        # gửi signal cho GUI nếu cần hiển thị ngay
+        # Ghi bảng tóm tắt vào STATUS_CSV (CỘT ĐẦU = TRACK_ID)
+        try:
+            ngay_vi_pham = now.strftime("%d/%m/%Y")
+            loai_vi_pham = "Vượt đèn đỏ"
+            tinh_trang = "Chờ xử lý"
+            with open(STATUS_CSV, mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    track_id, ngay_vi_pham, loai_vi_pham, tinh_trang
+                ])
+        except Exception as e:
+            self.status_signal.emit(f"Lỗi ghi status: {e}")
+
+        # Sau khi lưu thì chắc chắn track_id này đã vi phạm -> thêm vào set
+        self.violated_track_ids.add(track_id)
+
+        # Gửi signal cho GUI
         violation_info = {
-            "id": vid, "timestamp": datetime.datetime.now().isoformat(), "image_path": img_path,
-            "bbox": bbox, "cx": cx, "bottom_y": bottom_y, "lane": lane,
-            "light_right": light_right, "light_left": light_left
+            "id": vid,
+            "timestamp": now.isoformat(),
+            "image_path": img_path,
+            "bbox": bbox,
+            "cx": cx,
+            "bottom_y": bottom_y,
+            "lane": lane,
+            "light_right": light_right,
+            "light_left": light_left,
+            "track_id": track_id
         }
         self.new_violation_signal.emit(violation_info)
 
+    # ---------- Luồng chính ----------
     def run(self):
-        # tải model trong thread
+        # Tải model YOLO
         try:
             self.status_signal.emit("Đang tải model YOLO...")
             self.model = YOLO(self.model_path)
@@ -184,8 +448,7 @@ class DetectWorker(QThread):
             self.finished_signal.emit()
             return
 
-        # mở nguồn
-        cap = None
+        # Mở nguồn video/camera
         if isinstance(self.source, str) and os.path.exists(self.source):
             cap = cv2.VideoCapture(self.source)
         else:
@@ -212,44 +475,92 @@ class DetectWorker(QThread):
                 frame = cv2.resize(frame, (TARGET_W, TARGET_H))
                 fh, fw = frame.shape[:2]
 
+                # Dọn vi phạm cũ trong bộ nhớ (khử trùng theo thời gian)
+                self._cleanup_recent_violations()
+
+                # Lấy ROI đèn
                 roi_l_coords = clamp_roi(*ROI_LIGHT_LEFT, fw, fh)
                 roi_r_coords = clamp_roi(*ROI_LIGHT_RIGHT, fw, fh)
+                roi_l = frame[roi_l_coords[1]:roi_l_coords[3], roi_l_coords[0]:roi_l_coords[2]] if roi_l_coords else None
+                roi_r = frame[roi_r_coords[1]:roi_r_coords[3], roi_r_coords[0]:roi_r_coords[2]] if roi_r_coords else None
 
-                roi_l = None
-                roi_r = None
+                # Nhận diện màu đèn
+                light_left = detect_left_light(roi_l)          
+                light_right = detect_light_color(roi_r)        
+
+                # Vẽ ROI & text đèn trái
                 if roi_l_coords:
                     x1_l, y1_l, x2_l, y2_l = roi_l_coords
-                    roi_l = frame[y1_l:y2_l, x1_l:x2_l]
+                    cv2.rectangle(
+                        frame, (x1_l, y1_l), (x2_l, y2_l),
+                        COLOR_MAP.get(light_left, (255, 255, 255)), 2
+                    )
+                    cv2.putText(
+                        frame, f"LEFT: {light_left}",
+                        (x1_l, y1_l - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        COLOR_MAP.get(light_left), 2
+                    )
+
+                # Vẽ ROI & text đèn phải
                 if roi_r_coords:
                     x1_r, y1_r, x2_r, y2_r = roi_r_coords
-                    roi_r = frame[y1_r:y2_r, x1_r:x2_r]
+                    cv2.rectangle(
+                        frame, (x1_r, y1_r), (x2_r, y2_r),
+                        COLOR_MAP.get(light_right, (255, 255, 255)), 2
+                    )
+                    cv2.putText(
+                        frame, f"RIGHT: {light_right}",
+                        (max(0, x1_r - 50), y1_r - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        COLOR_MAP.get(light_right), 2
+                    )
 
-                left_hsv = bgr_mean_to_hsv_color(roi_l) if roi_l is not None else (None, None, None)
-                right_hsv = bgr_mean_to_hsv_color(roi_r) if roi_r is not None else (None, None, None)
-
-                light_left = decide_light_from_hsv(*left_hsv, is_right=False)
-                light_right = decide_light_from_hsv(*right_hsv, is_right=True)
-
-                # Vẽ ROI
-                if roi_l_coords:
-                    cv2.rectangle(frame, (x1_l, y1_l), (x2_l, y2_l), COLOR_MAP.get(light_left, (255,255,255)), 2)
-                    cv2.putText(frame, f"LEFT: {light_left}", (x1_l, y1_l - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_MAP.get(light_left), 2)
-                if roi_r_coords:
-                    cv2.rectangle(frame, (x1_r, y1_r), (x2_r, y2_r), COLOR_MAP.get(light_right, (255,255,255)), 2)
-                    cv2.putText(frame, f"RIGHT: {light_right}", (max(0, x1_r - 50), y1_r - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_MAP.get(light_right), 2)
-
-                # Vẽ vạch
+                # Vẽ vạch dừng theo trạng thái đèn phải
                 color_vach = COLOR_MAP.get(light_right, COLOR_MAP["UNKNOWN"])
-                cv2.line(frame, (STOP_LINE_X1, LINE_Y), (STOP_LINE_X2, LINE_Y), color_vach, LINE_THICKNESS)
-                cv2.line(frame, (STOP_LINE_X2 + 1, LINE_Y), (STOP_LINE_X3, LINE_Y), color_vach, LINE_THICKNESS)
+                cv2.line(
+                    frame, (STOP_LINE_X1, LINE_Y), (STOP_LINE_X2, LINE_Y),
+                    color_vach, LINE_THICKNESS
+                )
+                cv2.line(
+                    frame, (STOP_LINE_X2 + 1, LINE_Y), (STOP_LINE_X3, LINE_Y),
+                    color_vach, LINE_THICKNESS
+                )
 
+                # Vạch 3 (trái)
                 color_v3 = COLOR_MAP.get(light_left, COLOR_MAP["UNKNOWN"])
-                cv2.line(frame, (LINE3_X1, LINE3_Y1), (LINE3_X2, LINE3_Y2), color_v3, 3)
-                cv2.putText(frame, "Vach 3", (LINE3_X1 + 5, LINE3_Y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_v3, 2)
+                cv2.line(
+                    frame, (LINE3_X1, LINE3_Y1), (LINE3_X2, LINE3_Y2),
+                    color_v3, 3
+                )
+                cv2.putText(
+                    frame, "Vach 3",
+                    (LINE3_X1 + 5, LINE3_Y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_v3, 2
+                )
 
+                # Vạch S4 (phải)
                 color_s4 = COLOR_MAP.get(light_right, COLOR_MAP["UNKNOWN"])
-                cv2.line(frame, (LINE_S4_X1, LINE_S4_Y1), (LINE_S4_X2, LINE_S4_Y2), color_s4, 3)
-                cv2.putText(frame, "Vach S4", (LINE_S4_X1 - 80, LINE_S4_Y1 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_s4, 2)
+                cv2.line(
+                    frame, (LINE_S4_X1, LINE_S4_Y1), (LINE_S4_X2, LINE_S4_Y2),
+                    color_s4, 3
+                )
+                cv2.putText(
+                    frame, "Vach S4",
+                    (LINE_S4_X1 - 80, LINE_S4_Y1 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_s4, 2
+                )
+
+                # Vạch S5 (màu vàng, ngang từ (195,235) đến (1021,235))
+                cv2.line(
+                    frame, (LINE_S5_X1, LINE_S5_Y), (LINE_S5_X2, LINE_S5_Y),
+                    (0, 255, 255), 3  # Yellow
+                )
+                cv2.putText(
+                    frame, "Vach S5",
+                    (LINE_S5_X1, LINE_S5_Y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
+                )
 
                 # Chạy YOLO
                 try:
@@ -258,6 +569,8 @@ class DetectWorker(QThread):
                     self.status_signal.emit(f"Lỗi model trên frame: {e}")
                     results = None
 
+                # Thu thập detection cho tracker
+                detections = []
                 if results is not None:
                     for box in results[0].boxes:
                         try:
@@ -271,51 +584,100 @@ class DetectWorker(QThread):
                         bottom_y = y2_obj
                         cx = (x1_obj + x2_obj) // 2
 
-                        is_violating = False
-                        label_text = "hop le"
-                        color_box = (0, 255, 0)
-                        lane = "unknown"
+                        detections.append({
+                            "bbox": (x1_obj, y1_obj, x2_obj, y2_obj),
+                            "cx": cx,
+                            "bottom_y": bottom_y,
+                        })
 
-                        # Điều kiện Vi Phạm: đèn phải RED + xe vượt vạch (bottom_y > LINE_Y)
-                        # với tâm cx ở làn thứ 2 (STOP_LINE_X2 < cx <= STOP_LINE_X3)
-                        if light_right == "RED" and (STOP_LINE_X2 < cx <= STOP_LINE_X3) and bottom_y < LINE_Y:
+                # Tracking: gán ID cho mỗi xe
+                tracks = self.tracker.update(detections)
+
+                # Xử lý từng track
+                for tr in tracks:
+                    track_id = tr["id"]
+                    x1_obj, y1_obj, x2_obj, y2_obj = tr["bbox"]
+                    cx = tr["cx"]
+                    bottom_y = tr["bottom_y"]
+                    bbox = (x1_obj, y1_obj, x2_obj, y2_obj)
+
+                    # Nếu xe này đã từng vi phạm (theo file hoặc trong phiên) -> bỏ qua
+                    if track_id in self.violated_track_ids:
+                        continue
+
+                    is_violating = False
+                    label_text = f"ID {track_id}"
+                    color_box = (0, 255, 0)
+                    lane = "unknown"
+
+                    # Điều kiện vi phạm:
+                    # - Đèn phải bên phải RED
+                    # - Xe thuộc lane 2 (giữa STOP_LINE_X2 và STOP_LINE_X3)
+                    # - y đáy bbox > y S5 và < LINE_Y (vạch dừng)
+                    if (
+                        light_right == "RED"
+                        and (STOP_LINE_X2 < cx <= STOP_LINE_X3)
+                        and (LINE_S5_Y < bottom_y < LINE_Y)
+                    ):
+                        # Kiểm tra có trùng với vi phạm gần đây không
+                        if self._recently_captured(cx, bottom_y, bbox):
+                            # Đưa track_id vào set, coi như đã xử lý
+                            self.violated_track_ids.add(track_id)
+                            continue
+                        else:
                             is_violating = True
-                            label_text = "VI PHAM !"
-                            color_box = (0, 0, 255)
                             lane = "lane_2"
+                            label_text = f"VI PHAM ID {track_id}"
+                            color_box = (0, 0, 255)
 
-                        # Vẽ bbox và label
-                        cv2.rectangle(frame, (x1_obj, y1_obj), (x2_obj, y2_obj), color_box, 2)
-                        cv2.putText(frame, label_text, (x1_obj, max(0, y1_obj - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_box, 2)
+                    # Vẽ bbox + label
+                    cv2.rectangle(
+                        frame, (x1_obj, y1_obj), (x2_obj, y2_obj),
+                        color_box, 2
+                    )
+                    cv2.putText(
+                        frame, label_text,
+                        (x1_obj, max(0, y1_obj - 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_box, 2
+                    )
 
-                        # Nếu vi phạm -> crop & lưu ảnh + ghi report
-                        if is_violating:
-                            # mở rộng bbox một chút để ảnh dễ nhìn (padding)
-                            pad_x = int((x2_obj - x1_obj) * 0.1)  # 10% padding
-                            pad_y = int((y2_obj - y1_obj) * 0.1)
-                            cx1 = max(0, x1_obj - pad_x)
-                            cy1 = max(0, y1_obj - pad_y)
-                            cx2 = min(fw, x2_obj + pad_x)
-                            cy2 = min(fh, y2_obj + pad_y)
-                            crop = frame[cy1:cy2, cx1:cx2].copy() if (cy2>cy1 and cx2>cx1) else frame[y1_obj:y2_obj, x1_obj:x2_obj].copy()
-                            # Lưu thông tin
-                            try:
-                                self.save_violation(
-                                    crop_img=crop,
-                                    bbox=(x1_obj, y1_obj, x2_obj, y2_obj),
-                                    cx=cx,
-                                    bottom_y=bottom_y,
-                                    lane=lane,
-                                    light_right=light_right,
-                                    light_left=light_left
-                                )
-                                # cập nhật status ngắn để GUI hiển thị
-                                self.status_signal.emit(f"Phát hiện vi phạm: id {self.violation_counter}")
-                            except Exception as e:
-                                self.status_signal.emit(f"Lỗi lưu vi phạm: {e}")
+                    # Nếu vi phạm mới -> lưu
+                    if is_violating:
+                        self._add_recent_violation(track_id, cx, bottom_y, bbox)
+
+                        pad_x = int((x2_obj - x1_obj) * 0.1)
+                        pad_y = int((y2_obj - y1_obj) * 0.1)
+                        cx1 = max(0, x1_obj - pad_x)
+                        cy1 = max(0, y1_obj - pad_y)
+                        cx2 = min(fw, x2_obj + pad_x)
+                        cy2 = min(fh, y2_obj + pad_y)
+                        if cy2 > cy1 and cx2 > cx1:
+                            crop = frame[cy1:cy2, cx1:cx2].copy()
+                        else:
+                            crop = frame[y1_obj:y2_obj, x1_obj:x2_obj].copy()
+
+                        try:
+                            self.save_violation(
+                                crop_img=crop,
+                                bbox=bbox,
+                                cx=cx,
+                                bottom_y=bottom_y,
+                                lane=lane,
+                                light_right=light_right,
+                                light_left=light_left,
+                                track_id=track_id
+                            )
+                            self.status_signal.emit(
+                                f"Phát hiện vi phạm mới: violation_id {self.violation_counter} (track_id {track_id})"
+                            )
+                        except Exception as e:
+                            self.status_signal.emit(f"Lỗi lưu vi phạm: {e}")
 
                 # Cập nhật status
-                status_text = (f"Đèn Trái: {light_left} | Đèn Phải: {light_right} | Vi phạm đã lưu: {self.violation_counter}")
+                status_text = (
+                    f"Đèn Trái: {light_left} | Đèn Phải: {light_right} | "
+                    f"Số lần lưu vi phạm: {self.violation_counter}"
+                )
                 self.status_signal.emit(status_text)
 
                 # Hiển thị khung OpenCV
@@ -324,10 +686,14 @@ class DetectWorker(QThread):
                 if win_w > screen_w or win_h > screen_h:
                     scale = min(screen_w / win_w, screen_h / win_h) * 0.7
                     try:
-                        cv2.resizeWindow("Red Light Detection", int(win_w * scale), int(win_h * scale))
+                        cv2.resizeWindow(
+                            "Red Light Detection",
+                            int(win_w * scale), int(win_h * scale)
+                        )
                     except Exception:
                         pass
 
+                # Nhấn 'q' để dừng
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self._running = False
                     break
@@ -342,75 +708,78 @@ class DetectWorker(QThread):
             cv2.destroyAllWindows()
             self.finished_signal.emit()
 
+
+# ================== màn hình DIALOG PYQT ==================
 class RedLight_violationDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🚦 Nhận Diện Vượt Đèn Đỏ & Lưu Báo Cáo")
-        self.setFixedSize(640, 320)
+        self.setFixedSize(640, 260)
 
         screen_w, screen_h = get_screen_size()
-        self.move((screen_w - self.width()) // 2, (screen_h - self.height()) // 2)
+        self.move(
+            (screen_w - self.width()) // 2,
+            (screen_h - self.height()) // 2
+        )
 
         layout = QVBoxLayout()
-        self.label = QLabel("Hệ thống đã sẵn sàng.")
+        self.label = JLabel = QLabel("Hệ thống đã sẵn sàng.")
         self.btn_start = QPushButton("▶ Bắt đầu (Camera)")
         self.btn_video = QPushButton("📂 Chọn video")
         self.btn_stop = QPushButton("⏹ Dừng")
-        self.btn_report = QPushButton("📋 Xem báo cáo")
 
         layout.addWidget(self.label)
         layout.addWidget(self.btn_start)
         layout.addWidget(self.btn_video)
         layout.addWidget(self.btn_stop)
-        layout.addWidget(self.btn_report)
         self.setLayout(layout)
 
-        # worker thread
         self.worker = None
 
-        # Kết nối các nút
         self.btn_start.clicked.connect(self.start_detect_camera)
         self.btn_video.clicked.connect(self.start_detect_video)
         self.btn_stop.clicked.connect(self.stop_detect)
-        self.btn_report.clicked.connect(self.show_report)
 
-        # đảm bảo thư mục report tồn tại
         ensure_violation_dir()
 
     def update_status(self, text):
-        # cập nhật nhãn (giữ ngắn gọn)
         self.label.setText(text)
 
     def start_detect_camera(self):
         if self.worker is not None and self.worker.isRunning():
-            self.update_status("Đang chạy rồi.")
+            self.update_status("Đang chạy rồi.hi hi ^-^ !")
             return
         self.worker = DetectWorker(source=0, model_path="yolov8m.pt")
         self.worker.status_signal.connect(self.update_status)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.new_violation_signal.connect(self.on_new_violation)
         self.worker.start()
-        self.update_status("Bắt đầu camera...")
+        self.update_status("Bắt đầu camera... (nhấn Q để thoát cửa sổ OpenCV)")
 
     def start_detect_video(self):
         if self.worker is not None and self.worker.isRunning():
-            self.update_status("Đang chạy rồi.")
+            self.update_status("Đang chạy !")
             return
-        file_path, _ = QFileDialog.getOpenFileName(self, "Chọn video", "", "Video Files (*.mp4 *.avi *.mov)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn video", "", "Video Files (*.mp4 *.avi *.mov)"
+        )
         if file_path and os.path.exists(file_path):
             self.worker = DetectWorker(source=file_path, model_path="yolov8m.pt")
             self.worker.status_signal.connect(self.update_status)
             self.worker.finished_signal.connect(self.on_finished)
             self.worker.new_violation_signal.connect(self.on_new_violation)
             self.worker.start()
-            self.update_status(f"Bắt đầu phát hiện trên: {os.path.basename(file_path)}")
+            self.update_status(
+                f"Bắt đầu phát hiện trên: {os.path.basename(file_path)} "
+                "(nhấn Q để thoát cửa sổ OpenCV)"
+            )
         else:
             self.update_status("Chưa chọn file hoặc file không tồn tại.")
 
     def stop_detect(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.update_status("Đang dừng... (chờ thread kết thúc)")
+            self.update_status("Đang dừng !")
         else:
             self.update_status("Không có quá trình nào đang chạy.")
 
@@ -418,38 +787,17 @@ class RedLight_violationDialog(QDialog):
         self.update_status("Đã dừng phát hiện.")
 
     def on_new_violation(self, info):
-        # info là dict chứa thông tin vi phạm mới
-        self.update_status(f"Vi phạm mới: id {info.get('id')} - {info.get('timestamp')}")
+        self.update_status(
+            f"Vi phạm mới: violation_id {info.get('id')} - track_id {info.get('track_id')} - {info.get('timestamp')}"
+        )
 
-    def show_report(self):
-        # đọc CSV và hiển thị 10 dòng cuối
-        if not os.path.exists(REPORT_CSV):
-            QMessageBox.information(self, "Báo cáo", "Chưa có báo cáo vi phạm nào.")
-            return
-        try:
-            with open(REPORT_CSV, newline='', encoding='utf-8') as f:
-                reader = list(csv.reader(f))
-                if len(reader) <= 1:
-                    QMessageBox.information(self, "Báo cáo", "Chưa có mục vi phạm.")
-                    return
-                rows = reader[1:]  # skip header
-                last_rows = rows[-10:] if len(rows) > 10 else rows
-                # build message
-                msg_lines = []
-                for r in reversed(last_rows):
-                    # r: id, timestamp, image_path, x1,y1,x2,y2,cx,bottom_y,lane,light_right,light_left
-                    img = os.path.basename(r[2]) if r[2] else "no-image"
-                    msg_lines.append(f"ID {r[0]} | {r[1]} | {img} | lane:{r[9]} | lightR:{r[10]} | lightL:{r[11]}")
-                msg = "\n".join(msg_lines)
-                QMessageBox.information(self, "10 vi phạm gần nhất", msg)
-        except Exception as e:
-            QMessageBox.warning(self, "Lỗi", f"Không thể đọc báo cáo: {e}")
 
 def main():
     app = QApplication(sys.argv)
     dlg = RedLight_violationDialog()
     dlg.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
